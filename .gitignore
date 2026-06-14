@@ -1,0 +1,13 @@
+# Configuracion local del controlador (rutas especificas de cada maquina)
+controllers/*/runtime.ini
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Estado de sesion de Webots
+worlds/.*.wbproj
+
+# Sistema operativo
+.DS_Store

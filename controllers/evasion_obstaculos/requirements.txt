@@ -1,0 +1,4 @@
+# Dependencias del controlador Webots (Actividad 4.2)
+# Solo procesamiento de vision y sensores — sin inferencia de ML.
+numpy>=1.24.0
+opencv-python>=4.8.0
