@@ -38,41 +38,40 @@ Cámara + nodo Recognition
 Disparo de evasión:  bus_recognized  AND  lidar_dist < APPROACH_DIST (15 m)
 ```
 
-## Pipeline 3 — Evasión por seguimiento de pared derecha
+## Pipeline 3 — Evasión acotada por rumbo (giroscopio)
 
 ```
 Giroscopio (eje z)
    -> heading += gyro.getValues()[2] * dt        (yaw integrado)
 
-Sensores de distancia de un rayo (costado derecho)
-   -> ds_right_front / ds_right_mid / ds_right_rear  (getValue, 0-5 m)
-   -> ley de control de pared derecha               -> setSteeringAngle
-                                                     -> setCruisingSpeed(WALL_SPEED)
+Sensores de distancia de un rayo
+   -> ds_right_front / ds_right_mid / ds_right_rear  (costado derecho, 0-5 m)
+   -> ds_left                                        (barandal izquierdo, 0-8 m)
+   -> evasion acotada por rumbo  -> setSteeringAngle / setCruisingSpeed(EVADE_SPEED)
 ```
 
-## Máquina de estados
+## Máquina de estados (2 estados)
 
 ```
-LINE_FOLLOW ──(bus reconocido && lidar < 15 m)──────────────> APPROACH
-APPROACH ────(lidar < 8 m)──────────────────────────────────> SAVE_HEADING
-SAVE_HEADING ─(inmediato: guarda heading, frena)────────────> WALL_FOLLOW_RIGHT
-WALL_FOLLOW_RIGHT ─(wall_found && rr >= 4 m && steps > 50)───> RECOVER_HEADING
-RECOVER_HEADING ──(|heading - saved| < 0.08 && lidar libre)─> LINE_FOLLOW
+LINE_FOLLOW ──(bus reconocido && lidar < 16 m)──────────────> EVADE  (guarda heading)
+EVADE ──(rebasado: costado derecho libre && rumbo recto)────> LINE_FOLLOW
 ```
 
-### Ley de control de pared derecha (3 fases)
+La evasión usa dos sub-fases internas y un freno de seguridad:
 
-| Fase | Condición | Acción de dirección |
-|------|-----------|---------------------|
-| Búsqueda | aún sin `wall_found` (`rm >= 4 m`) | girar izquierda `-0.40` rad |
-| Esquina | `ds_right_front < 1.2 m` | giro fuerte izquierda `-MAX_ANGLE` |
-| Brecha | resto | `K_WALL * (rm - 1.5)`, clamp ±MAX_ANGLE |
+| Sub-fase / regla | Condición | Acción |
+|------------------|-----------|--------|
+| Freno de seguridad | `lidar < 4.5 m` y aún sin desviarse | frena (0.6) + giro `-MAX_ANGLE` para salir sin chocar |
+| OUT (salir) | `heading_dev < DEV_TARGET` y `ds_left ≥ 2 m` | girar izquierda `-SEARCH_STEER` |
+| Guarda del barandal | `ds_left < 2 m` | dejar de desviarse → pasar a enderezar |
+| PASS (pasar/enderezar) | resto | `steer = K_HEAD * heading_dev` (vuelve al rumbo) |
 
-### Recuperación de orientación
+**Anti-360:** la desviación a la izquierda está acotada por `DEV_TARGET` (giroscopio),
+por lo que el vehículo nunca puede dar la vuelta completa.
 
-`steer = K_RECOVER * (heading - saved_heading)`, clamp ±MAX_ANGLE. Al alinear
-(`|error| < 0.08` y LiDAR libre) se reinicia el integrador del PID y se reanuda
-el seguimiento de carril.
+**Reincorporación:** cuando el costado derecho queda libre (`rm,rr ≥ 4 m` tras haber
+visto el bus) y el rumbo está recto (`|heading - saved| < 0.12`), se reinicia el
+integrador del PID y se reanuda el seguimiento de carril.
 
 ## Tabla de dispositivos
 
@@ -80,21 +79,21 @@ el seguimiento de carril.
 |-------------|---------------|---------------|-----|
 | Cámara | `camera` | 256×128, FOV 1, BGRA, Recognition | Seguimiento de carril + reconocimiento del autobús |
 | LiDAR | `Sick LMS 291` | FOV 180°, ±20 índices centrales, < 20 m | Distancia al autobús |
-| Giroscopio | `gyro` | 3 ejes, rad/s (marco local) | Integración del heading en z |
-| DistanceSensor | `ds_right_front` | 1 rayo, lookupTable 0–5 m lineal | Detección de esquina frontal-derecha |
-| DistanceSensor | `ds_right_mid` | 1 rayo, lookupTable 0–5 m lineal | Control de brecha lateral |
-| DistanceSensor | `ds_right_rear` | 1 rayo, lookupTable 0–5 m lineal | "Último sensor": fin de la maniobra |
+| Giroscopio | `gyro` | 3 ejes, rad/s (marco local) | Integración del heading; acota la desviación (anti-360) |
+| DistanceSensor | `ds_right_front` | 1 rayo, 0–5 m | Costado derecho (detección del bus) |
+| DistanceSensor | `ds_right_mid` | 1 rayo, 0–5 m | Costado derecho (rebase) |
+| DistanceSensor | `ds_right_rear` | 1 rayo, 0–5 m | "Último sensor": confirma que el bus quedó atrás |
+| DistanceSensor | `ds_left` | 1 rayo, 0–8 m | Barandal izquierdo (limita la desviación) |
 
 ## Parámetros clave
 
 | Parámetro | Valor | Significado |
 |-----------|-------|-------------|
-| `APPROACH_DIST` | 15.0 m | LiDAR + reconocimiento disparan APPROACH |
-| `BRAKE_DIST` | 8.0 m | Inicia la maniobra (guarda heading) |
-| `TARGET_WALL_DIST` | 1.5 m | Brecha deseada al costado del autobús |
-| `CORNER_THRESHOLD` | 1.2 m | Umbral de esquina frontal-derecha |
-| `WALL_CLEAR_DIST` | 4.0 m | Sensor "libre" (sin obstáculo) |
-| `K_WALL` | 0.25 | Ganancia de control de brecha |
-| `K_RECOVER` | 0.80 | Ganancia de recuperación de heading |
-| `HEADING_TOLERANCE` | 0.08 rad | Tolerancia de re-alineación |
-| Velocidades | 30 / 10 / 12 / 20 km/h | LINE / APPROACH / WALL / RECOVER |
+| `APPROACH_DIST` | 16.0 m | bus reconocido + LiDAR < esto → inicia evasión |
+| `EMERGENCY_DIST` | 4.5 m | bus muy cerca de frente → freno de seguridad |
+| `DEV_TARGET` | 0.55 rad | desviación máxima al salir (anti-360, ~32°) |
+| `LEFT_LIMIT` | 2.0 m | `ds_left` < esto → no desviarse más (barandal) |
+| `WALL_CLEAR_DIST` | 4.0 m | sensor lateral "libre" (sin obstáculo) |
+| `K_HEAD` | 1.20 | ganancia para enderezar / volver al rumbo |
+| `HEADING_TOLERANCE` | 0.12 rad | tolerancia de rumbo recto para reincorporarse |
+| `EVADE_SPEED` | 10 km/h | velocidad durante la evasión |

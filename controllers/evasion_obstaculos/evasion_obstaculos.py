@@ -59,7 +59,7 @@ from vehicle import Driver
 # ============================================================
 
 # --- Velocidad y limites (reutilizados de la Act. 2.1 / 3.1) ---
-TARGET_SPEED = 30           # km/h — velocidad crucero en seguimiento de carril
+TARGET_SPEED = 22           # km/h — velocidad crucero en seguimiento de carril
 MAX_SPEED = 250             # km/h — limite de velocidad
 MAX_ANGLE = 0.5             # radianes — angulo maximo del volante
 
@@ -72,30 +72,28 @@ KD = 0.015                  # Derivativo (suaviza el giro)
 LIDAR_HALF_AREA = 20        # indices a cada lado del centro que revisamos
 LIDAR_MAX_DIST = 20.0       # metros — el LiDAR ignora cualquier cosa mas alla
 
-# --- Estados de la maquina de evasion ---
-STATE_LINE_FOLLOW  = "LINE_FOLLOW"        # seguimiento de carril con PID
-STATE_APPROACH     = "APPROACH"           # autobus reconocido, acercandose
-STATE_SAVE_HEADING = "SAVE_HEADING"       # guardar orientacion y frenar
-STATE_WALL_FOLLOW  = "WALL_FOLLOW_RIGHT"  # seguimiento de pared derecha
-STATE_RECOVER      = "RECOVER_HEADING"    # recuperar orientacion previa
+# --- Estados (maquina simple de 2 estados) ---
+STATE_LINE_FOLLOW = "LINE_FOLLOW"   # seguimiento de carril con PID
+STATE_EVADE       = "EVADE"         # evasion del autobus (sub-fases internas)
 
 # --- Umbrales de evasion ---
-APPROACH_DIST    = 15.0     # m: LiDAR ve el autobus Y la camara lo reconoce -> APPROACH
-BRAKE_DIST       =  8.0     # m: LiDAR < esto -> guardar heading y arrancar maniobra
-TARGET_WALL_DIST =  1.5     # m: brecha deseada entre el costado derecho y el autobus
-CORNER_THRESHOLD =  1.2     # m: ds_right_front < esto -> giro fuerte a la izquierda
-WALL_CLEAR_DIST  =  4.0     # m: sensor >= esto -> sin obstaculo a la derecha
-K_WALL           =  0.25    # ganancia proporcional: error de brecha -> direccion (rad)
-MIN_MANEUVER_STEPS = 50     # pasos minimos antes de evaluar la salida por sensor trasero
+APPROACH_DIST    = 16.0     # m: bus reconocido y LiDAR < esto -> empezar a evadir (con margen)
+WALL_CLEAR_DIST  =  4.0     # m: sensor lateral >= esto -> sin obstaculo a la derecha
+EMERGENCY_DIST   =  4.5     # m: si el bus esta tan cerca de frente y no me he desviado -> FRENAR
+LEFT_LIMIT       =  3.5     # m: ds_left < esto (barandal a la izquierda) -> dejar de desviarse
+RAIL_SAFE        =  3.0     # m: ds_left < esto -> empujar a la derecha (en TODOS los estados)
+RAIL_GAIN        =  0.30    # ganancia del empuje anti-barandal (rad por metro)
+SEARCH_STEER     =  0.30    # rad: giro a la izquierda para SALIR del carril (desviarse)
+DEV_TARGET       =  0.40    # rad: desviacion objetivo del rumbo al salir (~23 grados)
+K_HEAD           =  1.20    # ganancia para enderezar / volver al rumbo guardado (anti-360)
+MIN_MANEUVER_STEPS = 40     # pasos minimos dentro de la evasion antes de reincorporarse
+MANEUVER_FALLBACK = 800     # pasos maximos de la evasion (salida de seguridad)
 
-# --- Velocidades por estado ---
-APPROACH_SPEED   = 10.0     # km/h acercandose al autobus
-WALL_SPEED       = 12.0     # km/h durante la maniobra de pared
-RECOVER_SPEED    = 20.0     # km/h mientras re-alinea la orientacion
+# --- Velocidades ---
+EVADE_SPEED      = 10.0     # km/h durante la evasion (lento y controlado)
 
-# --- Recuperacion de orientacion (giroscopio) ---
-K_RECOVER        =  0.80    # ganancia: error de heading (rad) -> direccion (rad)
-HEADING_TOLERANCE=  0.08    # rad: |delta heading| < esto -> reanudar carril
+# --- Reincorporacion (giroscopio) ---
+HEADING_TOLERANCE = 0.12    # rad: |delta heading| < esto -> rumbo recuperado
 
 # --- Debug ---
 DEBUG_EVERY      = 30       # imprimir info cada N pasos
@@ -220,7 +218,7 @@ def detect_bus_ahead(camera):
         if obj.getModel() == "autobus":
             pos = obj.getPositionOnImage()   # [pixel_x, pixel_y]
             colors = obj.getColors()         # [r, g, b, ...]
-            if abs(pos[0] - cam_cx) < cam_cx * 0.5:
+            if abs(pos[0] - cam_cx) < cam_cx * 0.8:
                 return True, pos, colors
     return False, None, None
 
@@ -237,7 +235,8 @@ def main():
     # Camara + nodo Recognition (para reconocer el autobus)
     camera = driver.getDevice("camera")
     camera.enable(timestep)
-    camera.enableRecognition(timestep)
+    # En la API de Webots el metodo es recognitionEnable (no enableRecognition)
+    camera.recognitionEnable(timestep)
     cam_width = camera.getWidth()
     cam_height = camera.getHeight()
     setpoint = cam_width / 2.0
@@ -255,7 +254,8 @@ def main():
     ds_right_front = driver.getDevice("ds_right_front")
     ds_right_mid = driver.getDevice("ds_right_mid")
     ds_right_rear = driver.getDevice("ds_right_rear")
-    for ds in (ds_right_front, ds_right_mid, ds_right_rear):
+    ds_left = driver.getDevice("ds_left")   # detecta el barandal/objetos a la izquierda
+    for ds in (ds_right_front, ds_right_mid, ds_right_rear, ds_left):
         ds.enable(timestep)
 
     # Teclado para controles manuales de velocidad
@@ -271,8 +271,9 @@ def main():
 
     heading = 0.0           # yaw acumulado (integral del giroscopio en z)
     saved_heading = 0.0     # orientacion guardada al iniciar la evasion
-    wall_found = False      # ya se "engancho" la cara izquierda del autobus
-    maneuver_steps = 0      # pasos transcurridos dentro de la maniobra
+    evade_phase = "OUT"     # sub-fase de la evasion: "OUT" (salir) / "PASS" (pasar)
+    seen_right = False      # los sensores derechos llegaron a ver el autobus
+    maneuver_steps = 0      # pasos transcurridos dentro de la evasion
     step_count = 0
 
     print("[INFO] === Actividad 4.2 — Evasion de Obstaculos ===")
@@ -345,79 +346,74 @@ def main():
             rf = ds_right_front.getValue()
             rm = ds_right_mid.getValue()
             rr = ds_right_rear.getValue()
+            dl = ds_left.getValue()      # barandal / objeto a la izquierda
+
+            # Empuje anti-barandal (en TODOS los estados): si el riel izquierdo
+            # esta cerca, sumar correccion a la DERECHA (positiva) proporcional.
+            rail_bias = RAIL_GAIN * (RAIL_SAFE - dl) if dl < RAIL_SAFE else 0.0
 
             if vehicle_state == STATE_LINE_FOLLOW:
-                # Seguimiento normal de carril con PID
-                driver.setSteeringAngle(pid_steering)
-                driver.setCruisingSpeed(speed)
-                # Transicion: autobus reconocido y dentro del rango de aproximacion
-                if bus_recognized and lidar_dist is not None and lidar_dist < APPROACH_DIST:
-                    vehicle_state = STATE_APPROACH
-
-            elif vehicle_state == STATE_APPROACH:
-                # Seguir el carril pero reducir velocidad y vigilar la distancia
-                driver.setSteeringAngle(pid_steering)
-                driver.setCruisingSpeed(APPROACH_SPEED)
-                if lidar_dist is not None and lidar_dist < BRAKE_DIST:
-                    vehicle_state = STATE_SAVE_HEADING
-                elif not bus_recognized and (lidar_dist is None or lidar_dist > APPROACH_DIST):
-                    # Falsa alarma: el autobus ya no esta al frente
-                    vehicle_state = STATE_LINE_FOLLOW
-
-            elif vehicle_state == STATE_SAVE_HEADING:
-                # Guardar la orientacion actual y frenar (transicion de un paso)
-                saved_heading = heading
-                wall_found = False
-                maneuver_steps = 0
-                driver.setCruisingSpeed(0)
-                driver.setBrakeIntensity(1.0)
-                print(f"[SAVE_HEADING] Orientacion guardada = {saved_heading:.4f} rad — iniciando evasion")
-                vehicle_state = STATE_WALL_FOLLOW
-
-            elif vehicle_state == STATE_WALL_FOLLOW:
-                # Seguimiento de pared derecha con los 3 sensores laterales
+                # Seguimiento normal de carril con PID + correccion anti-barandal
                 driver.setBrakeIntensity(0.0)
-                driver.setCruisingSpeed(WALL_SPEED)
+                steer = max(-MAX_ANGLE, min(MAX_ANGLE, pid_steering + rail_bias))
+                driver.setSteeringAngle(steer)
+                driver.setCruisingSpeed(speed)
+                # Disparo: autobus reconocido y dentro del rango -> empezar evasion
+                if bus_recognized and lidar_dist is not None and lidar_dist < APPROACH_DIST:
+                    saved_heading = heading      # guardar orientacion (giroscopio)
+                    evade_phase = "OUT"          # sub-fase: salir del carril
+                    seen_right = False
+                    maneuver_steps = 0
+                    vehicle_state = STATE_EVADE
+                    print(f"[EVADE] Autobus a {lidar_dist:.1f} m — orientacion guardada = {saved_heading:.3f} rad")
+
+            elif vehicle_state == STATE_EVADE:
                 maneuver_steps += 1
+                heading_dev = heading - saved_heading   # >0 = desviado a la izquierda
 
-                if rm < WALL_CLEAR_DIST:
-                    wall_found = True   # ya vemos la cara izquierda del autobus
+                # Memoria: los sensores derechos llegaron a ver el autobus de costado
+                if rm < WALL_CLEAR_DIST or rr < WALL_CLEAR_DIST:
+                    seen_right = True
 
-                if not wall_found:
-                    # Fase 1: buscar el obstaculo girando a la izquierda
-                    wall_steering = -0.40
-                elif rf < CORNER_THRESHOLD:
-                    # Fase 2: esquina muy cerca al frente-derecha -> giro fuerte izquierda
-                    wall_steering = -MAX_ANGLE
+                # -------- FRENO DE SEGURIDAD (anti-colision) --------
+                # Si el bus esta muy cerca de frente y todavia no me he desviado,
+                # frenar fuerte y girar a fondo a la izquierda para salir sin chocar.
+                # (no se frena a 0 porque un carro Ackermann no gira detenido)
+                if (evade_phase == "OUT" and heading_dev < 0.20
+                        and lidar_dist is not None and lidar_dist < EMERGENCY_DIST):
+                    driver.setBrakeIntensity(0.6)
+                    driver.setCruisingSpeed(3)
+                    driver.setSteeringAngle(-MAX_ANGLE)
                 else:
-                    # Fase 3: control de brecha (mantener rm ~ TARGET_WALL_DIST)
-                    # error > 0 (muy lejos del bus) -> girar derecha (+)
-                    # error < 0 (muy cerca del bus) -> girar izquierda (-)
-                    gap_error = rm - TARGET_WALL_DIST
-                    wall_steering = K_WALL * gap_error
-                    wall_steering = max(-MAX_ANGLE, min(MAX_ANGLE, wall_steering))
+                    driver.setBrakeIntensity(0.0)
+                    driver.setCruisingSpeed(EVADE_SPEED)
 
-                driver.setSteeringAngle(wall_steering)
+                    if evade_phase == "OUT":
+                        # 1) SALIR: girar a la izquierda hasta desviarse DEV_TARGET.
+                        #    GUARDA DEL BARANDAL: si hay algo cerca a la izquierda
+                        #    (barandal), dejar de desviarse y pasar a enderezar.
+                        if dl < LEFT_LIMIT:
+                            evade_phase = "PASS"
+                        else:
+                            driver.setSteeringAngle(-SEARCH_STEER)
+                            if heading_dev >= DEV_TARGET:
+                                evade_phase = "PASS"
+                    else:
+                        # 2) PASAR y REINCORPORAR: enderezar (heading -> saved) y rebasar,
+                        #    sumando el empuje anti-barandal para no rozar el riel.
+                        steer = K_HEAD * heading_dev + rail_bias
+                        driver.setSteeringAngle(max(-MAX_ANGLE, min(MAX_ANGLE, steer)))
 
-                # Salida: ya enganchamos el bus, el sensor trasero esta libre
-                # y transcurrieron suficientes pasos
-                if wall_found and rr >= WALL_CLEAR_DIST and maneuver_steps > MIN_MANEUVER_STEPS:
-                    print("[WALL_FOLLOW] Obstaculo superado — iniciando recuperacion de orientacion")
-                    vehicle_state = STATE_RECOVER
-
-            elif vehicle_state == STATE_RECOVER:
-                # Recuperar la orientacion previa a la evasion con el giroscopio
-                heading_error = heading - saved_heading   # >0: giro neto a la izquierda
-                recover_steering = K_RECOVER * heading_error   # corregir girando a la derecha (+)
-                recover_steering = max(-MAX_ANGLE, min(MAX_ANGLE, recover_steering))
-                driver.setSteeringAngle(recover_steering)
-                driver.setCruisingSpeed(RECOVER_SPEED)
-
-                if abs(heading_error) < HEADING_TOLERANCE and lidar_dist is None:
+                # Reincorporacion: el costado derecho ya quedo libre (rebase el bus) o
+                # se agoto el tiempo de la maniobra; ademas el rumbo ya esta recto.
+                lado_libre = seen_right and rm >= WALL_CLEAR_DIST and rr >= WALL_CLEAR_DIST
+                if (evade_phase == "PASS" and abs(heading_dev) < HEADING_TOLERANCE
+                        and maneuver_steps > MIN_MANEUVER_STEPS
+                        and (lado_libre or maneuver_steps > MANEUVER_FALLBACK)):
                     integral = 0.0
                     prev_error = 0.0
                     smoothed_error = None
-                    print("[RECOVER] Orientacion recuperada — reanudando seguimiento de carril")
+                    print("[EVADE] Autobus rebasado — reincorporando al carril")
                     vehicle_state = STATE_LINE_FOLLOW
 
             # ====================================================
@@ -429,10 +425,9 @@ def main():
 
             if step_count % DEBUG_EVERY == 0:
                 dist_str = f"{lidar_dist:.1f}m" if lidar_dist is not None else "---"
-                if vehicle_state == STATE_APPROACH:
-                    print(f"[APPROACH] Autobus al frente | LiDAR={dist_str}")
-                print(f"[{vehicle_state}] LiDAR={dist_str} heading={heading:.3f} "
-                      f"saved={saved_heading:.3f} | rf={rf:.2f} rm={rm:.2f} rr={rr:.2f}")
+                extra = f" fase={evade_phase}" if vehicle_state == STATE_EVADE else ""
+                print(f"[{vehicle_state}{extra}] LiDAR={dist_str} heading={heading:.3f} "
+                      f"saved={saved_heading:.3f} | rf={rf:.2f} rm={rm:.2f} rr={rr:.2f} dl={dl:.2f}")
 
             # ====================================================
             # CONTROLES MANUALES DE VELOCIDAD

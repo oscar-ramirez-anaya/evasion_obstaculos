@@ -46,7 +46,7 @@
 4. [Arquitectura del sistema](#4-arquitectura-del-sistema)
 5. [Reconocimiento visual del autobus](#5-reconocimiento-visual-del-autobus)
 6. [LiDAR y deteccion de distancia](#6-lidar-y-deteccion-de-distancia)
-7. [Evasion por seguimiento de pared derecha](#7-evasion-por-seguimiento-de-pared-derecha)
+7. [Evasion acotada por rumbo (seguridad y barandal)](#7-evasion-acotada-por-rumbo-seguridad-y-barandal)
 8. [Integracion del giroscopio](#8-integracion-del-giroscopio)
 9. [Codigo del controlador autonomo](#9-codigo-del-controlador-autonomo)
 10. [Resultados](#10-resultados)
@@ -118,8 +118,9 @@ es de **30 km/h**.
 | Reaccion al obstaculo | Frenar / reducir velocidad | **Rodear** el obstaculo y recuperar la trayectoria |
 
 En el mundo de Webots se agregaron **4 autobuses estaticos** (representados como
-`Solid` con geometria `Box` y `recognitionColors`) y se incorporaron los **3 sensores
-de distancia** al `sensorsSlotCenter` del BmwX5.
+`Solid` con geometria `Box` y `recognitionColors`) y se incorporaron **4 sensores
+de distancia** al `sensorsSlotCenter` del BmwX5: 3 en el costado derecho y 1 en el
+izquierdo (para no invadir el barandal al evadir).
 
 ---
 
@@ -135,28 +136,30 @@ Pipeline 1 — Seguimiento de carril (reutilizado)
 
 Pipeline 2 — Deteccion del autobus
   LiDAR -> distancia        Camara+Recognition -> autobus al frente
-  Disparo:  autobus reconocido AND lidar_dist < 15 m
+  Disparo:  autobus reconocido AND lidar_dist < 16 m
 
-Pipeline 3 — Evasion por pared derecha
-  Giroscopio -> heading     Sensores derechos -> ley de pared -> setSteeringAngle
+Pipeline 3 — Evasion acotada por rumbo
+  Giroscopio -> heading (acota la desviacion, anti-360)
+  Sensores derechos -> rebase    ds_left -> barandal    -> setSteeringAngle
 ```
 
-### Maquina de estados
+### Maquina de estados (2 estados)
 
 ```
-LINE_FOLLOW ──(bus reconocido && lidar < 15 m)──────────────> APPROACH
-APPROACH ────(lidar < 8 m)──────────────────────────────────> SAVE_HEADING
-SAVE_HEADING ─(guarda heading, frena)───────────────────────> WALL_FOLLOW_RIGHT
-WALL_FOLLOW_RIGHT ─(wall_found && rr >= 4 m && steps > 50)───> RECOVER_HEADING
-RECOVER_HEADING ──(|heading - saved| < 0.08 && lidar libre)─> LINE_FOLLOW
+LINE_FOLLOW ──(bus reconocido && lidar < 16 m)──────────────> EVADE  (guarda heading)
+EVADE ──(rebasado: costado derecho libre && rumbo recto)────> LINE_FOLLOW
 ```
+
+La evasion tiene dos sub-fases internas (**OUT** salir a la izquierda y **PASS**
+enderezar/rebasar) y un **freno de seguridad** que frena fuerte si el autobus queda
+muy cerca de frente sin haberse desviado todavia.
 
 ---
 
 ## 5. Reconocimiento visual del autobus
 
 La camara del vehiculo tiene habilitado el **nodo Recognition** de Webots. En el
-controlador se activa con `camera.enableRecognition(timestep)` y en cada paso se
+controlador se activa con `camera.recognitionEnable(timestep)` y en cada paso se
 consultan los objetos detectados:
 
 ```python
@@ -191,48 +194,50 @@ range_data = lidar.getRangeImage()
 avg_dist = obstacle_dist / collision_count
 ```
 
-Cuando el autobus es reconocido **y** la distancia del LiDAR baja de **15 m**, el
-vehiculo entra al estado `APPROACH`, reduce su velocidad a 10 km/h y reporta la
-distancia en consola (evidencia del **paso 2** de la rubrica). Al bajar de **8 m**
-se dispara la maniobra de evasion.
+Cuando el autobus es reconocido **y** la distancia del LiDAR baja de **16 m**, el
+vehiculo guarda la orientacion con el giroscopio, reduce su velocidad a 10 km/h y
+arranca la evasion, reportando la distancia en consola (evidencia del **paso 2** de
+la rubrica). Si el autobus quedara muy cerca de frente (< 4.5 m) sin haberse desviado,
+un **freno de seguridad** evita la colision.
 
 ---
 
-## 7. Evasion por seguimiento de pared derecha
+## 7. Evasion acotada por rumbo (seguridad y barandal)
 
-Al cruzar el umbral de 8 m, el controlador deja de seguir la linea, **lee el
-giroscopio para guardar la orientacion** y frena momentaneamente (estado
-`SAVE_HEADING`, **paso 3** de la rubrica). Acto seguido entra a `WALL_FOLLOW_RIGHT`.
+Al dispararse la evasion, el controlador **lee el giroscopio para guardar la
+orientacion** (`saved_heading`, **paso 3** de la rubrica) y ejecuta una maniobra
+**acotada por el rumbo**, de modo que el vehiculo nunca pueda girar de mas (anti-360).
 
-Se montaron **3 sensores de distancia de un solo rayo** en el costado derecho del
-vehiculo, apuntando hacia afuera:
+Se montaron **4 sensores de distancia de un solo rayo** en el BmwX5:
 
 | Sensor | Posicion | Rol |
 |--------|----------|-----|
-| `ds_right_front` | frontal-derecha | detecta esquina; fuerza giro a la izquierda |
-| `ds_right_mid` | centro-derecha | control de brecha (realimentacion principal) |
-| `ds_right_rear` | trasero-derecha | **ultimo sensor**: indica el fin de la maniobra |
+| `ds_right_front` | frontal-derecha | costado derecho (detecta el bus) |
+| `ds_right_mid` | centro-derecha | costado derecho (rebase) |
+| `ds_right_rear` | trasero-derecha | **ultimo sensor**: confirma que el bus quedo atras |
+| `ds_left` | costado izquierdo | **barandal**: limita cuanto se desvia el vehiculo |
 
-Cada sensor usa una `lookupTable [0 0 0, 5 5 0]` (rango lineal 0–5 m). La ley de
-control de pared derecha tiene tres fases:
+La logica de evasion tiene dos sub-fases y un freno de seguridad:
 
 ```python
-if rm < WALL_CLEAR_DIST:
-    wall_found = True                 # se engancha la cara izquierda del autobus
-
-if not wall_found:
-    wall_steering = -0.40             # Fase 1: buscar girando a la izquierda
-elif rf < CORNER_THRESHOLD:
-    wall_steering = -MAX_ANGLE        # Fase 2: esquina cercana -> giro fuerte izquierda
-else:
-    gap_error = rm - TARGET_WALL_DIST # Fase 3: mantener ~1.5 m de brecha
-    wall_steering = K_WALL * gap_error
-    wall_steering = max(-MAX_ANGLE, min(MAX_ANGLE, wall_steering))
+# FRENO DE SEGURIDAD: bus muy cerca de frente y aun sin desviarse -> frenar
+if evade_phase == "OUT" and heading_dev < 0.20 and lidar_dist < EMERGENCY_DIST:
+    driver.setBrakeIntensity(0.6); driver.setCruisingSpeed(3)
+    driver.setSteeringAngle(-MAX_ANGLE)
+elif evade_phase == "OUT":
+    if dl < LEFT_LIMIT:               # barandal cerca a la izquierda -> dejar de salir
+        evade_phase = "PASS"
+    else:
+        driver.setSteeringAngle(-SEARCH_STEER)   # 1) SALIR a la izquierda (acotado)
+        if heading_dev >= DEV_TARGET:            #    tope de desviacion (anti-360)
+            evade_phase = "PASS"
+else:                                            # 2) PASS: enderezar y rebasar
+    driver.setSteeringAngle(K_HEAD * heading_dev)
 ```
 
-El algoritmo **termina** cuando el autobus ya fue enganchado, el **ultimo sensor**
-(trasero-derecho) ya no ve obstaculo (`rr >= 4 m`) y transcurrieron suficientes
-pasos (evidencia del **paso 4** de la rubrica). Entonces se pasa a `RECOVER_HEADING`.
+La maniobra **termina** cuando el **ultimo sensor** derecho (trasero) ya no ve el
+autobus (`rr >= 4 m`, tras haberlo visto) y el rumbo esta recto (evidencia del
+**paso 4** de la rubrica). Entonces el vehiculo se reincorpora al carril.
 
 ---
 
@@ -246,18 +251,19 @@ controlador la integra en cada paso para estimar el `heading` (orientacion acumu
 heading += gyro.getValues()[2] * (timestep / 1000.0)
 ```
 
-Al iniciar la evasion se guarda `saved_heading = heading`. En el estado
-`RECOVER_HEADING` el vehiculo gira proporcionalmente al error de orientacion hasta
-re-alinearse con la direccion previa a la evasion:
+Al iniciar la evasion se guarda `saved_heading = heading`. Durante la sub-fase **PASS**
+el vehiculo se endereza girando proporcionalmente al error de orientacion (`heading_dev`),
+volviendo al rumbo previo a la evasion:
 
 ```python
-heading_error = heading - saved_heading
-recover_steering = K_RECOVER * heading_error
-recover_steering = max(-MAX_ANGLE, min(MAX_ANGLE, recover_steering))
+heading_dev = heading - saved_heading
+driver.setSteeringAngle(K_HEAD * heading_dev)   # endereza (anti-360)
 ```
 
-Cuando `|heading_error| < 0.08 rad` y el LiDAR esta libre, se reinicia el integrador
-del PID y se reanuda el seguimiento de carril (evidencia del **paso 5** de la rubrica).
+El rumbo guardado tambien **acota la desviacion** maxima al salir (`DEV_TARGET`), lo
+que hace imposible un giro de 360. Cuando el costado derecho queda libre y
+`|heading_dev| < 0.12 rad`, se reinicia el integrador del PID y se reanuda el
+seguimiento de carril (evidencia del **paso 5** de la rubrica).
 
 ---
 
@@ -281,11 +287,11 @@ Ejemplo de salida en consola durante una evasion completa:
 
 ```
 [RECOGNITION] Autobus detectado | pos_imagen=(128,70) | color=(1.00,0.50,0.00)
-[APPROACH] Autobus al frente | LiDAR=12.1m
-[SAVE_HEADING] Orientacion guardada = 0.0021 rad — iniciando evasion
-[WALL_FOLLOW_RIGHT] LiDAR=--- heading=0.341 saved=0.002 | rf=5.00 rm=1.48 rr=5.00
-[WALL_FOLLOW] Obstaculo superado — iniciando recuperacion de orientacion
-[RECOVER] Orientacion recuperada — reanudando seguimiento de carril
+[EVADE] Autobus a 12.1 m — orientacion guardada = 0.002 rad
+[EVADE fase=OUT] LiDAR=4.5m heading=0.094 saved=0.002 | rf=5.00 rm=5.00 rr=5.00 dl=6.20
+[EVADE fase=PASS] LiDAR=3.8m heading=0.005 saved=0.002 | rf=3.20 rm=3.19 rr=3.18 dl=4.10
+[EVADE] Autobus rebasado — reincorporando al carril
+[LINE_FOLLOW] LiDAR=--- heading=-0.003 saved=0.002 | rf=5.00 rm=5.00 rr=5.00 dl=8.00
 ```
 
 ---
