@@ -77,7 +77,7 @@ STATE_LINE_FOLLOW = "LINE_FOLLOW"   # seguimiento de carril con PID
 STATE_EVADE       = "EVADE"         # evasion del autobus (sub-fases internas)
 
 # --- Umbrales de evasion ---
-APPROACH_DIST    = 16.0     # m: bus reconocido y LiDAR < esto -> empezar a evadir (con margen)
+APPROACH_DIST    = 18.0     # m: bus reconocido y LiDAR < esto -> empezar a evadir (mas margen)
 WALL_CLEAR_DIST  =  4.0     # m: sensor lateral >= esto -> sin obstaculo a la derecha
 EMERGENCY_DIST   =  4.5     # m: si el bus esta tan cerca de frente y no me he desviado -> FRENAR
 LEFT_LIMIT       =  3.5     # m: ds_left < esto (barandal a la izquierda) -> dejar de desviarse
@@ -374,6 +374,8 @@ def main():
                 # Memoria: los sensores derechos llegaron a ver el autobus de costado
                 if rm < WALL_CLEAR_DIST or rr < WALL_CLEAR_DIST:
                     seen_right = True
+                # El costado derecho ya vio el bus y ahora esta libre -> rebasado
+                lado_libre = seen_right and rm >= WALL_CLEAR_DIST and rr >= WALL_CLEAR_DIST
 
                 # -------- FRENO DE SEGURIDAD (anti-colision) --------
                 # Si el bus esta muy cerca de frente y todavia no me he desviado,
@@ -398,22 +400,26 @@ def main():
                             driver.setSteeringAngle(-SEARCH_STEER)
                             if heading_dev >= DEV_TARGET:
                                 evade_phase = "PASS"
+                    elif lado_libre:
+                        # 3) RECUPERAR: el bus ya quedo atras. La reincorporacion la
+                        #    guia el SEGUIDOR DE LINEA (merge suave hacia el carril),
+                        #    no solo enderezando el rumbo -> recuperacion mas optima.
+                        steer = pid_steering + rail_bias
+                        driver.setSteeringAngle(max(-MAX_ANGLE, min(MAX_ANGLE, steer)))
                     else:
-                        # 2) PASAR y REINCORPORAR: enderezar (heading -> saved) y rebasar,
-                        #    sumando el empuje anti-barandal para no rozar el riel.
+                        # 2) PASAR: enderezar (heading -> saved) y mantenerse paralelo
+                        #    al bus, con empuje anti-barandal para no rozar el riel.
                         steer = K_HEAD * heading_dev + rail_bias
                         driver.setSteeringAngle(max(-MAX_ANGLE, min(MAX_ANGLE, steer)))
 
-                # Reincorporacion: el costado derecho ya quedo libre (rebase el bus) o
-                # se agoto el tiempo de la maniobra; ademas el rumbo ya esta recto.
-                lado_libre = seen_right and rm >= WALL_CLEAR_DIST and rr >= WALL_CLEAR_DIST
-                if (evade_phase == "PASS" and abs(heading_dev) < HEADING_TOLERANCE
+                # Reincorporacion: el bus quedo atras y la linea ya es visible -> el
+                # seguidor de linea toma el control para un merge optimo al carril.
+                if (evade_phase == "PASS" and lado_libre
                         and maneuver_steps > MIN_MANEUVER_STEPS
-                        and (lado_libre or maneuver_steps > MANEUVER_FALLBACK)):
+                        and (smoothed_error is not None or maneuver_steps > MANEUVER_FALLBACK)):
                     integral = 0.0
                     prev_error = 0.0
-                    smoothed_error = None
-                    print("[EVADE] Autobus rebasado — reincorporando al carril")
+                    print("[EVADE] Autobus rebasado — reincorporando al carril (seguidor de linea)")
                     vehicle_state = STATE_LINE_FOLLOW
 
             # ====================================================
