@@ -700,7 +700,7 @@ BmwX5 {
 # 'model "autobus"' y 'recognitionColors' = baseColor para el nodo Recognition.
 # ============================================================================
 DEF BUS_1 Solid {
-  translation 105.131 8 1.52
+  translation 107.5 8 1.52
   rotation 0 0 1 0
   children [
     Shape {
@@ -724,7 +724,7 @@ DEF BUS_1 Solid {
   }
 }
 DEF BUS_2 Solid {
-  translation 105.131 22 1.52
+  translation 107.5 22 1.52
   rotation 0 0 1 0
   children [
     Shape {
@@ -748,7 +748,7 @@ DEF BUS_2 Solid {
   }
 }
 DEF BUS_3 Solid {
-  translation 105.131 36 1.52
+  translation 107.5 36 1.52
   rotation 0 0 1 0
   children [
     Shape {
@@ -772,7 +772,7 @@ DEF BUS_3 Solid {
   }
 }
 DEF BUS_4 Solid {
-  translation 105.131 50 1.52
+  translation 107.5 50 1.52
   rotation 0 0 1 0
   children [
     Shape {
