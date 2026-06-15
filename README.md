@@ -316,7 +316,7 @@ pueden ajustarse visualmente en Webots segun el trazado especifico de la ruta.
 
 ## 11. Video demostrativo
 
-[Enlace al video en YouTube](https://youtu.be/PENDIENTE)
+[Enlace al video en YouTube](https://youtu.be/WJLqJnh1GRA)
 
 El video (< 5 min) explica cada uno de los pasos del algoritmo de evasion y demuestra
 que el vehiculo conserva el comportamiento de seguidor de linea antes y despues de
