@@ -298,6 +298,8 @@ Ejemplo de salida en consola durante una evasion completa:
 
 ## 10. Resultados
 
+![Evasion de obstaculos en Webots](screenshots/evacion.png)
+
 El vehiculo completa el ciclo de evasion de forma autonoma:
 
 1. **Reconoce** cada autobus mediante el nodo Recognition y lo reporta en consola.
